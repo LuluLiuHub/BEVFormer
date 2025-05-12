@@ -134,3 +134,4 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+r101_dcn_fcos3d_pretrain.pth

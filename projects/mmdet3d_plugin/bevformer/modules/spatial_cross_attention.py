@@ -27,6 +27,115 @@ from projects.mmdet3d_plugin.models.utils.bricks import run_time
 ext_module = ext_loader.load_ext(
     '_ext', ['ms_deform_attn_backward', 'ms_deform_attn_forward'])
 
+@ATTENTION.register_module()
+class ProbabilisticSpatialCrossAttention(BaseModule):
+    def __init__(self, embed_dims, num_points=4, num_levels=4, num_cams=6, pc_range=None, deformable_attention=None, **kwargs):
+        super().__init__(**kwargs)
+        self.embed_dims = embed_dims
+        self.num_points = num_points
+        self.num_levels = num_levels
+        self.num_cams = num_cams
+
+        # === NEW: Height distribution predictor ===
+        self.height_predictor = nn.Sequential(
+            nn.Linear(embed_dims, embed_dims),
+            nn.ReLU(),
+            nn.Linear(embed_dims, 2)  # Output: [mu_z, log_sigma_z]
+        )
+        # === END NEW ===
+
+        # Define deformable attention and FFN layers (simplified for clarity)
+        if deformable_attention is None:
+            deformable_attention = dict(
+                type='MSDeformableAttention3D',
+                embed_dims=embed_dims,
+                num_levels=num_levels,
+                num_points=num_points)
+        self.deform_attn = build_attention(deformable_attention)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dims, embed_dims),
+            nn.ReLU(),
+            nn.Linear(embed_dims, embed_dims)
+        )
+
+    def forward(self, bev_queries, bev_pos, image_feats, proj_mats, spatial_shapes, level_start_index, bev_mask=None):
+        """
+        bev_queries: [num_queries, embed_dims]
+        bev_pos: [num_queries, embed_dims]
+        image_feats: List of [B, C, H, W] for each camera
+        proj_mats: [B, num_cams, 4, 4] projection matrices
+        spatial_shapes: [num_levels, 2] spatial shapes of image features
+        level_start_index: [num_levels] start index of each level
+        bev_mask: [B, num_queries] mask for BEV queries
+        """
+        # === NEW: Predict height distribution ===
+        N, C = bev_queries.shape
+        device = bev_queries.device
+        
+        mu_logsigma = self.height_predictor(bev_queries)  # [N, 2]
+        mu_z = mu_logsigma[:, 0]
+        log_sigma_z = mu_logsigma[:, 1]
+        sigma_z = torch.exp(log_sigma_z)
+
+        # Sample heights from Gaussian
+        mu_z = mu_z.unsqueeze(1).expand(N, self.num_points)
+        sigma_z = sigma_z.unsqueeze(1).expand(N, self.num_points)
+        z_samples = torch.normal(mu_z, sigma_z).to(bev_queries.device)  # [N, num_points]
+        # === END NEW ===
+
+        # Assume bev_queries contains (x, y) positions in BEV grid already
+        # For simplicity, generate dummy xy positions (should come from grid in practice)
+        # create new BEV grid xy locations
+        grid_size = int(N ** 0.5)  # Assuming square grid for simplicity
+        y, x = torch.meshgrid(torch.linspace(0, 1, grid_size, device=device),
+                               torch.linspace(0, 1, grid_size, device=device))
+        xy = torch.stack((x.flatten(), y.flatten()), dim=-1)[:N]  # [N, 2]
+        xy_pos = xy.unsqueeze(1).expand(-1, self.num_points, -1)  # [N, num_points, 2]
+
+        # === NEW: Form 3D reference points ===
+        z_samples = z_samples.unsqueeze(-1)  # [N, num_points, 1]
+        ref_points_3d = torch.cat([xy_pos, z_samples], dim=-1)  # [N, num_points, 3]
+        ref_points_3d = ref_points_3d.unsqueeze(0).expand(self.num_cams, -1, -1, -1)  # [num_cams, N, num_points, 3]
+        ref_points_flat = ref_points_3d.reshape(-1, 3)  # [num_cams * N, 3]
+        ref_points_homo = torch.cat([ref_points_flat, torch.ones(ref_points_flat.shape[0], 1, device=device)], dim=-1)  # [num_cams * N, 4]
+        # === END NEW ===
+
+        # === Project 3D points to 2D and sample image features ===
+        proj = proj_mats[0].repeat_interleave(N * self.num_points, dim=0)
+        pts_cam = (proj @ ref_points_homo.unsqueeze(-1)).squeeze(-1)
+        pts_2d = pts_cam[:, :2] / (pts_cam[:, 2:3] + 1e-6)
+
+        reference_points_2d = pts_2d.reshape(self.num_cams, N, self.num_points, 2).mean(2)
+        reference_points_2d = reference_points_2d.permute(1, 0, 2).unsqueeze(2).expand(-1, -1, self.num_levels, -1)
+        reference_points_2d = reference_points_2d.reshape(-1, self.num_levels, 2)
+        
+        # === NEW: Flatten image features ===
+        bs = 1
+        img_feats_flat = [feat.view(bs * self.num_cams, C, -1).permute(0, 2, 1) for feat in image_feats]
+        value = torch.cat(img_feats_flat, dim=1)
+        # === END NEW ===
+
+        # === NEW: Apply deformable attention ===
+        query = bev_queries.unsqueeze(0)
+        out = self.deform_attn(
+            query=query,
+            value=value,
+            reference_points=reference_points_2d.unsqueeze(0),
+            spatial_shapes=spatial_shapes,
+            level_start_index=level_start_index
+        )
+        out = self.ffn(out.squeeze(0) + bev_queries)
+        
+        return out, mu_z, sigma_z
+        # === END NEW ===
+        # sampled_feats = torch.zeros_like(bev_queries)  # [N, embed_dims]
+
+        # # Attention and FFN
+        # attn_out = self.self_attn(bev_queries, sampled_feats, None)  # Simplified
+        # out = self.ffn(attn_out + bev_queries)
+
+        # return out, mu_z[:, 0], sigma_z[:, 0]  # Optionally return for KL loss outside
 
 @ATTENTION.register_module()
 class SpatialCrossAttention(BaseModule):

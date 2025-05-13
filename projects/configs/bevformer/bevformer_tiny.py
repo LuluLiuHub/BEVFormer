@@ -99,7 +99,9 @@ model = dict(
                             embed_dims=_dim_,
                             num_levels=1),
                         dict(
-                            type='SpatialCrossAttention',
+                            # MODIFIED to use custom attention
+                            type='ProbabilisticSpatialCrossAttention',
+                            # type='SpatialCrossAttention',
                             pc_range=point_cloud_range,
                             deformable_attention=dict(
                                 type='MSDeformableAttention3D',
@@ -107,6 +109,9 @@ model = dict(
                                 num_points=8,
                                 num_levels=_num_levels_),
                             embed_dims=_dim_,
+                            # MOIDIFIED
+                            num_points=8,
+                            num_levels=4,
                         )
                     ],
                     feedforward_channels=_ffn_dim_,

@@ -3,6 +3,8 @@
 # ---------------------------------------------
 #  Modified by Zhiqi Li
 # ---------------------------------------------
+#  Modified by Lulu Liu
+# ---------------------------------------------
 
 from projects.mmdet3d_plugin.models.utils.bricks import run_time
 from .multi_scale_deformable_attn_function import MultiScaleDeformableAttnFunction_fp32
@@ -248,7 +250,7 @@ class TemporalSelfAttention(BaseModule):
                 value, spatial_shapes, level_start_index, sampling_locations,
                 attention_weights, self.im2col_step)
         else:
-
+        # Will not be used
             output = multi_scale_deformable_attn_pytorch(
                 value, spatial_shapes, sampling_locations, attention_weights)
 
@@ -259,6 +261,7 @@ class TemporalSelfAttention(BaseModule):
         # fuse history value and current value
         # (num_query, embed_dims, bs*num_bev_queue)-> (num_query, embed_dims, bs, num_bev_queue)
         output = output.view(num_query, embed_dims, bs, self.num_bev_queue)
+        #################### Need modification ############################
         output = output.mean(-1)
 
         # (num_query, embed_dims, bs)-> (bs, num_query, embed_dims)

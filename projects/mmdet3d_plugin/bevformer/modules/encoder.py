@@ -25,17 +25,11 @@ ext_module = ext_loader.load_ext(
 class BEVFormerEncoder(TransformerLayerSequence):
 
     """
-    Attention with both self and cross
-    Implements the decoder in DETR transformer.
-    Args:
-        return_intermediate (bool): Whether to return intermediate outputs.
-        coder_norm_cfg (dict): Config of last normalization layer. Default：
-            `LN`.
+    Attention with both self and cross.
+    Implements the encoder in DETR-like transformer.
     """
 
-    def __init__(self, *args, pc_range=None, num_points_in_pillar=4, return_intermediate=False, dataset_type='nuscenes',
-                 **kwargs):
-
+    def __init__(self, *args, pc_range=None, num_points_in_pillar=4, return_intermediate=False, dataset_type='nuscenes', **kwargs):
         super(BEVFormerEncoder, self).__init__(*args, **kwargs)
         self.return_intermediate = return_intermediate
 
@@ -43,45 +37,41 @@ class BEVFormerEncoder(TransformerLayerSequence):
         self.pc_range = pc_range
         self.fp16_enabled = False
 
-    @staticmethod
-    def get_reference_points(H, W, Z=8, num_points_in_pillar=4, dim='3d', bs=1, device='cuda', dtype=torch.float):
-        """Get the reference points used in SCA and TSA.
-        Args:
-            H, W: spatial shape of bev.
-            Z: hight of pillar.
-            D: sample D points uniformly from each pillar.
-            device (obj:`device`): The device where
-                reference_points should be.
-        Returns:
-            Tensor: reference points used in decoder, has \
-                shape (bs, num_keys, num_levels, 2).
-        """
+        # ✅ Register as instance parameters
+        self.z_mu = torch.nn.Parameter(torch.tensor(0.5))
+        self.z_log_sigma = torch.nn.Parameter(torch.tensor(-1.0))
 
-        # reference points in 3D space, used in spatial cross-attention (SCA)
+    def get_height_params(self):
+        return self.z_mu, self.z_log_sigma
+
+    def get_reference_points(self, H, W, Z=8, num_points_in_pillar=4, dim='3d', bs=1, device='cuda', dtype=torch.float):
+        """Generates reference points for spatial cross-attention and temporal self-attention."""
         if dim == '3d':
-            zs = torch.linspace(0.5, Z - 0.5, num_points_in_pillar, dtype=dtype,
-                                device=device).view(-1, 1, 1).expand(num_points_in_pillar, H, W) / Z
-            xs = torch.linspace(0.5, W - 0.5, W, dtype=dtype,
-                                device=device).view(1, 1, W).expand(num_points_in_pillar, H, W) / W
-            ys = torch.linspace(0.5, H - 0.5, H, dtype=dtype,
-                                device=device).view(1, H, 1).expand(num_points_in_pillar, H, W) / H
-            ref_3d = torch.stack((xs, ys, zs), -1)
-            ref_3d = ref_3d.permute(0, 3, 1, 2).flatten(2).permute(0, 2, 1)
-            ref_3d = ref_3d[None].repeat(bs, 1, 1, 1)
+            # ✅ Learnable Gaussian height anchors
+            num_ref_z = num_points_in_pillar
+            z_sigma = torch.exp(self.z_log_sigma)
+            z_samples = torch.linspace(-1.0, 1.0, num_ref_z, device=device)
+            z_values = self.z_mu + z_sigma * z_samples
+            zs = z_values.view(num_ref_z, 1, 1).expand(num_ref_z, H, W) / Z
+
+            xs = torch.linspace(0.5, W - 0.5, W, dtype=dtype, device=device).view(1, 1, W).expand(num_ref_z, H, W) / W
+            ys = torch.linspace(0.5, H - 0.5, H, dtype=dtype, device=device).view(1, H, 1).expand(num_ref_z, H, W) / H
+
+            ref_3d = torch.stack((xs, ys, zs), -1)  # [Z, H, W, 3]
+            ref_3d = ref_3d.permute(0, 3, 1, 2).flatten(2).permute(0, 2, 1)  # [Z, HW, 3]
+            ref_3d = ref_3d[None].repeat(bs, 1, 1, 1)  # [B, Z*HW, 3]
             return ref_3d
 
         # reference points on 2D bev plane, used in temporal self-attention (TSA).
         elif dim == '2d':
             ref_y, ref_x = torch.meshgrid(
-                torch.linspace(
-                    0.5, H - 0.5, H, dtype=dtype, device=device),
-                torch.linspace(
-                    0.5, W - 0.5, W, dtype=dtype, device=device)
+                torch.linspace(0.5, H - 0.5, H, dtype=dtype, device=device),
+                torch.linspace(0.5, W - 0.5, W, dtype=dtype, device=device)
             )
             ref_y = ref_y.reshape(-1)[None] / H
             ref_x = ref_x.reshape(-1)[None] / W
-            ref_2d = torch.stack((ref_x, ref_y), -1)
-            ref_2d = ref_2d.repeat(bs, 1, 1).unsqueeze(2)
+            ref_2d = torch.stack((ref_x, ref_y), -1)  # [1, HW, 2]
+            ref_2d = ref_2d.repeat(bs, 1, 1).unsqueeze(2)  # [B, HW, 1, 2]
             return ref_2d
 
     # This function must use fp32!!!
@@ -186,7 +176,13 @@ class BEVFormerEncoder(TransformerLayerSequence):
         intermediate = []
 
         ref_3d = self.get_reference_points(
-            bev_h, bev_w, self.pc_range[5]-self.pc_range[2], self.num_points_in_pillar, dim='3d', bs=bev_query.size(1),  device=bev_query.device, dtype=bev_query.dtype)
+            bev_h, bev_w, Z=self.pc_range[5] - self.pc_range[2],
+            num_points_in_pillar=self.num_points_in_pillar,
+            dim='3d', bs=bev_query.size(1),
+            device=bev_query.device, dtype=bev_query.dtype
+        )
+        # ref_3d = self.get_reference_points(
+        #     bev_h, bev_w, self.pc_range[5]-self.pc_range[2], self.num_points_in_pillar, dim='3d', bs=bev_query.size(1),  device=bev_query.device, dtype=bev_query.dtype)
         ref_2d = self.get_reference_points(
             bev_h, bev_w, dim='2d', bs=bev_query.size(1), device=bev_query.device, dtype=bev_query.dtype)
 

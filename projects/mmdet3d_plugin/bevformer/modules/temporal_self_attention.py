@@ -103,6 +103,8 @@ class TemporalSelfAttention(BaseModule):
         self.attention_weights = nn.Linear(embed_dims*self.num_bev_queue,
                                            num_bev_queue*num_heads * num_levels * num_points)
         self.value_proj = nn.Linear(embed_dims, embed_dims)
+        self.confidence = nn.Linear(embed_dims*self.num_bev_queue,
+                                           num_bev_queue*num_heads * num_levels * num_points)
         self.output_proj = nn.Linear(embed_dims, embed_dims)
         self.init_weights()
 
@@ -262,7 +264,29 @@ class TemporalSelfAttention(BaseModule):
         # (num_query, embed_dims, bs*num_bev_queue)-> (num_query, embed_dims, bs, num_bev_queue)
         output = output.view(num_query, embed_dims, bs, self.num_bev_queue)
         #################### Need modification ############################
-        output = output.mean(-1)
+          #### Add confidence to the attention weights
+        conf_level = self.confidence(query).view(
+            bs, num_query,  self.num_heads, self.num_bev_queue, self.num_levels, self.num_points)
+        conf_level = conf_level.softmax(dim=3)
+      
+        # Normalize across BEV queues (current vs. history) for each point
+        # total_weight = conf_level.sum(dim=3, keepdim=True) + 1e-6  # [bs, num_query, num_heads, 1, num_levels, num_points]
+        # conf_level_normalized = conf_level / total_weight 
+
+        # Average over heads, levels, points -> shape: (bs, num_query, num_bev_queue)
+        conf_level_avg = conf_level.mean(dim=(2, 4, 5))  # -> (bs, num_query, num_bev_queue)
+        # Softmax over time (num_bev_queue)
+        conf_level_avg = conf_level_avg.softmax(dim=2)
+        # use only 2 dimensions
+       
+        curr_bev_weight =  conf_level_avg[:, :, 1].permute(1, 0).unsqueeze(1)  # (bs, num_query)
+        hist_bev_weight =  conf_level_avg[:, :, 0].permute(1, 0).unsqueeze(1)  # (bs, num_query)
+
+        # Dynamically fuse
+        output = (curr_bev_weight * output[:, :, :, 1] + 
+        hist_bev_weight * output[:, :, :, 0])
+ 
+        # output = output.mean(-1)
 
         # (num_query, embed_dims, bs)-> (bs, num_query, embed_dims)
         output = output.permute(2, 0, 1)

@@ -36,34 +36,22 @@ class TensorCPField(nn.Module):
         self.C = nn.Parameter(torch.randn(rank, t_size))
         self.proj = nn.Linear(rank, feature_dim)
 
+    def forward(self, x_norm, y_norm, t_norm):
+        Ax = self.interpolate_1d(self.A, x_norm, self.x_size)
+        By = self.interpolate_1d(self.B, y_norm, self.y_size)
+        Ct = self.interpolate_1d(self.C, t_norm, self.t_size)
+        feat = Ax * By * Ct
+        feat = feat.permute(1,0).contiguous()
+        return self.proj(feat.T)
+
     def interpolate_1d(self, tensor, idx_norm, axis_size):
-        """
-        tensor: [rank, size]
-        idx_norm: [N] normalized coordinate in [0, 1]
-        axis_size: int
-        Returns: interpolated tensor [rank, N]
-        """
         idx = idx_norm * (axis_size - 1)
         idx0 = torch.floor(idx).long().clamp(0, axis_size - 2)
         idx1 = idx0 + 1
-        weight = (idx - idx0.float()).unsqueeze(0)  # [1, N]
-
-        v0 = tensor[:, idx0]  # [rank, N]
-        v1 = tensor[:, idx1]  # [rank, N]
-        return (1 - weight) * v0 + weight * v1  # [rank, N]
-
-    def query(self, x_norm, y_norm, t_norm):
-        """
-        x_norm, y_norm, t_norm: [N] normalized coords in [0, 1]
-        Returns: [N, feature_dim]
-        """
-        Ax = self.interpolate_1d(self.A, x_norm, self.x_size)  # [rank, N]
-        By = self.interpolate_1d(self.B, y_norm, self.y_size)  # [rank, N]
-        Ct = self.interpolate_1d(self.C, t_norm, self.t_size)  # [rank, N]
-
-        feat = Ax * By * Ct  # [rank, N]
-        feat = feat.sum(dim=0)  # [N]
-        return self.proj(feat.T)  # [N, feature_dim]
+        weight = (idx - idx0.float()).unsqueeze(0)
+        v0 = tensor[:, idx0]
+        v1 = tensor[:, idx1]
+        return (1 - weight) * v0 + weight * v1
 
 @ATTENTION.register_module()
 class TemporalSelfAttention(BaseModule):
@@ -150,6 +138,7 @@ class TemporalSelfAttention(BaseModule):
         # Add fall back to tensorCP confidence
         self.grid_conf = nn.Linear(embed_dims, 1)
         self.init_weights()
+        self.tensorcp = None
 
     def init_weights(self):
         """Default initialization for Parameters of Module."""
@@ -313,7 +302,17 @@ class TemporalSelfAttention(BaseModule):
         output = output.view(num_query, embed_dims, bs, self.num_bev_queue)
         
         #################### Need modification ############################
-        
+        if self.tensorcp is None:
+            max_h = spatial_shapes[:, 0].max().item()
+            max_w = spatial_shapes[:, 1].max().item()
+            self.tensorcp = TensorCPField(
+                x_size=max_w,
+                y_size=max_h,
+                t_size=2,
+                rank=32,
+                feature_dim=self.embed_dims
+            ).to(query.device)
+
         with torch.cuda.stream(stream_tensorcp):
             # Call tensorCP to get another set of result:
             num_heads = self.num_heads
@@ -325,8 +324,8 @@ class TemporalSelfAttention(BaseModule):
             t_hist = torch.zeros_like(x)       
             t_curr = torch.ones_like(x)       
 
-            feat_hist = self.tensorcp.query(x, y, t_hist)  # [M, embed_dim]
-            feat_curr = self.tensorcp.query(x, y, t_curr)
+            feat_hist = self.tensorcp(x, y, t_hist)  # [M, embed_dim]
+            feat_curr = self.tensorcp(x, y, t_curr)
 
             feat_hist = feat_hist.view(bs, num_query, num_heads, num_levels, num_points, self.embed_dims)
             feat_curr = feat_curr.view(bs, num_query, num_heads, num_levels, num_points, self.embed_dims)

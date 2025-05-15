@@ -28,22 +28,43 @@ class TensorCPField(nn.Module):
     def __init__(self, x_size, y_size, t_size, rank=32, feature_dim=256):
         super().__init__()
         self.rank = rank
+        self.x_size = x_size
+        self.y_size = y_size
+        self.t_size = t_size
         self.A = nn.Parameter(torch.randn(rank, x_size))
         self.B = nn.Parameter(torch.randn(rank, y_size))
         self.C = nn.Parameter(torch.randn(rank, t_size))
         self.proj = nn.Linear(rank, feature_dim)
 
-    def query(self, x_idx, y_idx, t_idx):
-        x_idx = (x_idx * (self.A.shape[1] - 1)).long().clamp(0, self.A.shape[1] - 1)
-        y_idx = (y_idx * self.B.shape[1] - 1).long().clamp(0, self.B.shape[1] - 1)
-        t_idx = (t_idx * self.C.shape[1] - 1).long().clamp(0, self.C.shape[1] - 1)
-        Ax = self.A[:, x_idx]
-        By = self.B[:, y_idx]
-        Ct = self.C[:, t_idx]
-        feat = Ax * By * Ct
-        feat = feat.sum(dim=0).T
-        return self.proj(feat)
-    
+    def interpolate_1d(self, tensor, idx_norm, axis_size):
+        """
+        tensor: [rank, size]
+        idx_norm: [N] normalized coordinate in [0, 1]
+        axis_size: int
+        Returns: interpolated tensor [rank, N]
+        """
+        idx = idx_norm * (axis_size - 1)
+        idx0 = torch.floor(idx).long().clamp(0, axis_size - 2)
+        idx1 = idx0 + 1
+        weight = (idx - idx0.float()).unsqueeze(0)  # [1, N]
+
+        v0 = tensor[:, idx0]  # [rank, N]
+        v1 = tensor[:, idx1]  # [rank, N]
+        return (1 - weight) * v0 + weight * v1  # [rank, N]
+
+    def query(self, x_norm, y_norm, t_norm):
+        """
+        x_norm, y_norm, t_norm: [N] normalized coords in [0, 1]
+        Returns: [N, feature_dim]
+        """
+        Ax = self.interpolate_1d(self.A, x_norm, self.x_size)  # [rank, N]
+        By = self.interpolate_1d(self.B, y_norm, self.y_size)  # [rank, N]
+        Ct = self.interpolate_1d(self.C, t_norm, self.t_size)  # [rank, N]
+
+        feat = Ax * By * Ct  # [rank, N]
+        feat = feat.sum(dim=0)  # [N]
+        return self.proj(feat.T)  # [N, feature_dim]
+
 @ATTENTION.register_module()
 class TemporalSelfAttention(BaseModule):
     """An attention module used in BEVFormer based on Deformable-Detr.
@@ -324,7 +345,7 @@ class TemporalSelfAttention(BaseModule):
        
         
         fall_back_score = torch.sigmoid(self.grid_conf(query))  # [B, N, 1]
-        fall_back_score = fall_back_score.permute(1,0,2)
+        fall_back_score = fall_back_score.permute(1,0,2).clamp(0.0, 1.0)
         torch.cuda.synchronize()
 
         output = fall_back_score * output + (1 - fall_back_score) * output_tensorcp

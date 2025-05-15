@@ -37,9 +37,9 @@ class BEVFormerEncoder(TransformerLayerSequence):
         self.pc_range = pc_range
         self.fp16_enabled = False
 
-        # ✅ Register as instance parameters
-        self.z_mu = torch.nn.Parameter(torch.tensor(0.5))
-        self.z_log_sigma = torch.nn.Parameter(torch.tensor(-1.0))
+        # MODIFY: add learnable height anchors using Multivariate Gaussian
+        self.z_mu = torch.nn.Parameter(torch.tensor([0.3, 0.5, 0.7, 0.9]))  # [Z]
+        self.z_log_sigma = torch.nn.Parameter(torch.full((self.num_points_in_pillar,), -1.0))  # [Z]
 
     def get_height_params(self):
         return self.z_mu, self.z_log_sigma
@@ -47,12 +47,12 @@ class BEVFormerEncoder(TransformerLayerSequence):
     def get_reference_points(self, H, W, Z=8, num_points_in_pillar=4, dim='3d', bs=1, device='cuda', dtype=torch.float):
         """Generates reference points for spatial cross-attention and temporal self-attention."""
         if dim == '3d':
-            # ✅ Learnable Gaussian height anchors
+            # MODIFY: Learnable Gaussian height anchors
             num_ref_z = num_points_in_pillar
             z_sigma = torch.exp(self.z_log_sigma)
             z_samples = torch.linspace(-1.0, 1.0, num_ref_z, device=device)
             z_values = self.z_mu + z_sigma * z_samples
-            zs = z_values.view(num_ref_z, 1, 1).expand(num_ref_z, H, W) / Z
+            zs = z_values.view(num_ref_z, 1, 1).expand(num_ref_z, H, W) / Z # [Z, H, W]
 
             xs = torch.linspace(0.5, W - 0.5, W, dtype=dtype, device=device).view(1, 1, W).expand(num_ref_z, H, W) / W
             ys = torch.linspace(0.5, H - 0.5, H, dtype=dtype, device=device).view(1, H, 1).expand(num_ref_z, H, W) / H

@@ -23,7 +23,27 @@ from mmcv.utils import ext_loader
 ext_module = ext_loader.load_ext(
     '_ext', ['ms_deform_attn_backward', 'ms_deform_attn_forward'])
 
+# Add TensorCP for auxilary architecture when the conf is low
+class TensorCPField(nn.Module):
+    def __init__(self, x_size, y_size, t_size, rank=32, feature_dim=256):
+        super().__init__()
+        self.rank = rank
+        self.A = nn.Parameter(torch.randn(rank, x_size))
+        self.B = nn.Parameter(torch.randn(rank, y_size))
+        self.C = nn.Parameter(torch.randn(rank, t_size))
+        self.proj = nn.Linear(rank, feature_dim)
 
+    def query(self, x_idx, y_idx, t_idx):
+        x_idx = (x_idx * (self.A.shape[1] - 1)).long().clamp(0, self.A.shape[1] - 1)
+        y_idx = (y_idx * self.B.shape[1] - 1).long().clamp(0, self.B.shape[1] - 1)
+        t_idx = (t_idx * self.C.shape[1] - 1).long().clamp(0, self.C.shape[1] - 1)
+        Ax = self.A[:, x_idx]
+        By = self.B[:, y_idx]
+        Ct = self.C[:, t_idx]
+        feat = Ax * By * Ct
+        feat = feat.sum(dim=0).T
+        return self.proj(feat)
+    
 @ATTENTION.register_module()
 class TemporalSelfAttention(BaseModule):
     """An attention module used in BEVFormer based on Deformable-Detr.
@@ -106,6 +126,8 @@ class TemporalSelfAttention(BaseModule):
         self.confidence = nn.Linear(embed_dims*self.num_bev_queue,
                                            num_bev_queue*num_heads * num_levels * num_points)
         self.output_proj = nn.Linear(embed_dims, embed_dims)
+        # Add fall back to tensorCP confidence
+        self.grid_conf = nn.Linear(embed_dims, 1)
         self.init_weights()
 
     def init_weights(self):
@@ -222,6 +244,7 @@ class TemporalSelfAttention(BaseModule):
 
         attention_weights = attention_weights.permute(0, 3, 1, 2, 4, 5)\
             .reshape(bs*self.num_bev_queue, num_query, self.num_heads, self.num_levels, self.num_points).contiguous()
+        
         sampling_offsets = sampling_offsets.permute(0, 3, 1, 2, 4, 5, 6)\
             .reshape(bs*self.num_bev_queue, num_query, self.num_heads, self.num_levels, self.num_points, 2)
 
@@ -241,16 +264,20 @@ class TemporalSelfAttention(BaseModule):
             raise ValueError(
                 f'Last dim of reference_points must be'
                 f' 2 or 4, but get {reference_points.shape[-1]} instead.')
+        
         if torch.cuda.is_available() and value.is_cuda:
-
+            # run both architecture in parallel to save time
+            stream_deform = torch.cuda.Stream()
+            stream_tensorcp = torch.cuda.Stream()
             # using fp16 deformable attention is unstable because it performs many sum operations
             if value.dtype == torch.float16:
                 MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
             else:
                 MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
-            output = MultiScaleDeformableAttnFunction.apply(
-                value, spatial_shapes, level_start_index, sampling_locations,
-                attention_weights, self.im2col_step)
+            with torch.cuda.stream(stream_deform):
+                output = MultiScaleDeformableAttnFunction.apply(
+                    value, spatial_shapes, level_start_index, sampling_locations,
+                    attention_weights, self.im2col_step)
         else:
         # Will not be used
             output = multi_scale_deformable_attn_pytorch(
@@ -263,8 +290,47 @@ class TemporalSelfAttention(BaseModule):
         # fuse history value and current value
         # (num_query, embed_dims, bs*num_bev_queue)-> (num_query, embed_dims, bs, num_bev_queue)
         output = output.view(num_query, embed_dims, bs, self.num_bev_queue)
+        
         #################### Need modification ############################
-          #### Add confidence to the attention weights
+        
+        with torch.cuda.stream(stream_tensorcp):
+            # Call tensorCP to get another set of result:
+            coords = sampling_locations.reshape(bs * num_query * num_heads * num_levels * num_points, 2)
+            x, y = coords[:, 0], coords[:, 1]
+            t_hist = torch.zeros_like(x)       
+            t_curr = torch.ones_like(x)       
+
+            feat_hist = self.tensorcp.query(x, y, t_hist)  # [M, embed_dim]
+            feat_curr = self.tensorcp.query(x, y, t_curr)
+
+            feat_hist = feat_hist.view(bs, num_query, num_heads, num_levels, num_points, self.embed_dims)
+            feat_curr = feat_curr.view(bs, num_query, num_heads, num_levels, num_points, self.embed_dims)
+
+            # Use current attention weights:
+            attn_weights = attention_weights.view(bs, self.num_bev_queue, num_query, num_heads, num_levels, num_points)
+            attn_hist = attn_weights[:, 0]  # [bs, num_query, num_heads, num_levels, num_points]
+            attn_curr = attn_weights[:, 1]
+
+            attn_hist = attn_hist.unsqueeze(-1)  # [bs, num_query, num_heads, num_levels, num_points, 1]
+            attn_curr = attn_curr.unsqueeze(-1)
+            
+            fused_hist = (feat_hist * attn_hist).sum(dim=(2, 3, 4))  # [bs, num_query, embed_dim]
+            fused_curr = (feat_curr * attn_curr).sum(dim=(2, 3, 4))
+
+            fused_hist = fused_hist.permute(1, 2, 0)  # [num_query, embed_dim, bs]
+            fused_curr = fused_curr.permute(1, 2, 0)
+
+            output_tensorcp = torch.stack([fused_hist, fused_curr], dim=-1)  # [num_query, embed_dim, bs, 2]
+       
+        
+        fall_back_score = torch.sigmoid(self.grid_conf(query))  # [B, N, 1]
+        fall_back_score = fall_back_score.permute(1,0,2)
+        torch.cuda.synchronize()
+
+        output = fall_back_score * output + (1 - fall_back_score) * output_tensorcp
+
+        
+        #### Add confidence to the attention weights
         conf_level = self.confidence(query).view(
             bs, num_query,  self.num_heads, self.num_bev_queue, self.num_levels, self.num_points)
         conf_level = conf_level.softmax(dim=3)

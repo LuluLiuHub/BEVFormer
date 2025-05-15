@@ -24,25 +24,26 @@ ext_module = ext_loader.load_ext(
     '_ext', ['ms_deform_attn_backward', 'ms_deform_attn_forward'])
 
 # Add TensorCP for auxilary architecture when the conf is low
+# it takes the x_size, y_size, t_size, scale
+# and get feature embeddings 256
+# for t=0, use sampling locations
+# for t=1, use reference points
 class TensorCPField(nn.Module):
-    def __init__(self, x_size, y_size, t_size, rank=32, feature_dim=256):
+    class TensorCPField(nn.Module):
+    def __init__(self, x_size, y_size, t_size, s_size, rank=32, feature_dim=256):
         super().__init__()
         self.rank = rank
         self.x_size = x_size
         self.y_size = y_size
         self.t_size = t_size
-        self.A = nn.Parameter(torch.randn(rank, x_size))
-        self.B = nn.Parameter(torch.randn(rank, y_size))
-        self.C = nn.Parameter(torch.randn(rank, t_size))
-        self.proj = nn.Linear(rank, feature_dim)
+        self.s_size = s_size
 
-    def forward(self, x_norm, y_norm, t_norm):
-        Ax = self.interpolate_1d(self.A, x_norm, self.x_size)
-        By = self.interpolate_1d(self.B, y_norm, self.y_size)
-        Ct = self.interpolate_1d(self.C, t_norm, self.t_size)
-        feat = Ax * By * Ct
-        feat = feat.permute(1,0).contiguous()
-        return self.proj(feat.T)
+        self.A = nn.Parameter(torch.randn(rank, x_size))  # x
+        self.B = nn.Parameter(torch.randn(rank, y_size))  # y
+        self.C = nn.Parameter(torch.randn(rank, t_size))  # time
+        self.D = nn.Parameter(torch.randn(rank, s_size))  # scale
+
+        self.proj = nn.Linear(rank, feature_dim)
 
     def interpolate_1d(self, tensor, idx_norm, axis_size):
         idx = idx_norm * (axis_size - 1)
@@ -52,6 +53,16 @@ class TensorCPField(nn.Module):
         v0 = tensor[:, idx0]
         v1 = tensor[:, idx1]
         return (1 - weight) * v0 + weight * v1
+
+    def forward(self, x_norm, y_norm, t_norm, s_norm):
+        Ax = self.interpolate_1d(self.A, x_norm, self.x_size)  # [rank, N]
+        By = self.interpolate_1d(self.B, y_norm, self.y_size)
+        Ct = self.interpolate_1d(self.C, t_norm, self.t_size)
+        Ds = self.interpolate_1d(self.D, s_norm, self.s_size)
+
+        feat = Ax * By * Ct * Ds  # [rank, N]
+        feat = feat.permute(1, 0).contiguous()  # [N, rank]
+        return self.proj(feat)  # [N, feature_dim]
 
 @ATTENTION.register_module()
 class TemporalSelfAttention(BaseModule):
@@ -306,12 +317,14 @@ class TemporalSelfAttention(BaseModule):
             max_h = spatial_shapes[:, 0].max().item()
             max_w = spatial_shapes[:, 1].max().item()
             self.tensorcp = TensorCPField(
-                x_size=max_w,
-                y_size=max_h,
+                x_size=int(max_w),
+                y_size=int(max_h),
                 t_size=2,
+                s_size=self.num_levels,
                 rank=32,
                 feature_dim=self.embed_dims
             ).to(query.device)
+
 
         with torch.cuda.stream(stream_tensorcp):
             # Call tensorCP to get another set of result:
@@ -319,13 +332,31 @@ class TemporalSelfAttention(BaseModule):
             num_levels = self.num_levels
             num_points = self.num_points
 
-            coords = sampling_locations.view(-1, 2)
-            x, y = coords[:, 0], coords[:, 1]
+            coords_hist = sampling_locations[:bs]  # use history half
+            coords_hist = coords_hist.permute(0, 2, 1, 3, 4, 5).contiguous()  # [bs, heads, queries, levels, points, 2]
+            coords_hist = coords_hist.view(bs * num_heads * num_query * num_levels * num_points, 2)
+            x, y = coords_hist[:, 0], coords[:, 1]
+
+            # Coordinates for t=1: reference_points (current)
+            # reference_points: [bs, num_query, num_levels, 2]
+            coords_curr = reference_points  # [bs, num_query, num_levels, 2]
+            coords_curr = coords_curr.unsqueeze(2).expand(-1, -1, num_heads, -1, -1)  # [bs, queries, heads, levels, 2]
+            coords_curr = coords_curr.unsqueeze(4).expand(-1, -1, -1, -1, num_points, -1)  # [bs, queries, heads, levels, points, 2]
+            coords_curr = coords_curr.contiguous().view(bs * num_query * num_heads * num_levels * num_points, 2)
+                    
+            x_curr, y_curr = coords_curr[:, 0], coords_curr[:, 1]
             t_hist = torch.zeros_like(x)       
             t_curr = torch.ones_like(x)       
 
-            feat_hist = self.tensorcp(x, y, t_hist)  # [M, embed_dim]
-            feat_curr = self.tensorcp(x, y, t_curr)
+            # Form scale to pass
+            scale_ids = torch.arange(num_levels, device=query.device).float()
+            scale_ids = scale_ids / (num_levels - 1)  # normalize to [0,1]
+            scale_tensor = scale_ids[None, None,None, :, None].expand(bs, num_query, num_heads, num_levels, num_points)
+            scale_tensor = scale_tensor.contiguous().view(-1)
+
+
+            feat_hist = self.tensorcp(x, y, t_hist,scale_tensor)  # [M, embed_dim]
+            feat_curr = self.tensorcp(x_curr, y_curr, t_curr,scale_tensor)
 
             feat_hist = feat_hist.view(bs, num_query, num_heads, num_levels, num_points, self.embed_dims)
             feat_curr = feat_curr.view(bs, num_query, num_heads, num_levels, num_points, self.embed_dims)
@@ -347,8 +378,11 @@ class TemporalSelfAttention(BaseModule):
             output_tensorcp = torch.stack([fused_hist, fused_curr], dim=-1)  # [num_query, embed_dim, bs, 2]
        
         
-        fall_back_score = torch.sigmoid(self.grid_conf(query))  # [B, N, 1]
-        fall_back_score = fall_back_score.permute(1,0,2).clamp(0.0, 1.0)
+        fall_back_score = torch.sigmoid(self.grid_conf(query))  # [bs, num_query, 1]
+        fall_back_score = fall_back_score.permute(1, 2, 0)  # [num_query, 1, bs]
+        fall_back_score = fall_back_score.expand(-1, self.embed_dims, -1)  # [num_query, embed_dim, bs]
+        fall_back_score = fall_back_score.unsqueeze(-1)  # [num_query, embed_dim, bs, 1]
+
         torch.cuda.synchronize()
 
         output = fall_back_score * output + (1 - fall_back_score) * output_tensorcp

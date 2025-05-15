@@ -316,7 +316,11 @@ class TemporalSelfAttention(BaseModule):
         
         with torch.cuda.stream(stream_tensorcp):
             # Call tensorCP to get another set of result:
-            coords = sampling_locations.reshape(bs * num_query * num_heads * num_levels * num_points, 2)
+            num_heads = self.num_heads
+            num_levels = self.num_levels
+            num_points = self.num_points
+
+            coords = sampling_locations.view(-1, 2)
             x, y = coords[:, 0], coords[:, 1]
             t_hist = torch.zeros_like(x)       
             t_curr = torch.ones_like(x)       

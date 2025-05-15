@@ -29,7 +29,6 @@ ext_module = ext_loader.load_ext(
 # for t=0, use sampling locations
 # for t=1, use reference points
 class TensorCPField(nn.Module):
-    class TensorCPField(nn.Module):
     def __init__(self, x_size, y_size, t_size, s_size, rank=32, feature_dim=256):
         super().__init__()
         self.rank = rank
@@ -335,16 +334,15 @@ class TemporalSelfAttention(BaseModule):
             coords_hist = sampling_locations[:bs]  # use history half
             coords_hist = coords_hist.permute(0, 2, 1, 3, 4, 5).contiguous()  # [bs, heads, queries, levels, points, 2]
             coords_hist = coords_hist.view(bs * num_heads * num_query * num_levels * num_points, 2)
-            x, y = coords_hist[:, 0], coords[:, 1]
+            x, y = coords_hist[:, 0], coords_hist[:, 1]
 
             # Coordinates for t=1: reference_points (current)
-            # reference_points: [bs, num_query, num_levels, 2]
-            coords_curr = reference_points  # [bs, num_query, num_levels, 2]
-            coords_curr = coords_curr.unsqueeze(2).expand(-1, -1, num_heads, -1, -1)  # [bs, queries, heads, levels, 2]
-            coords_curr = coords_curr.unsqueeze(4).expand(-1, -1, -1, -1, num_points, -1)  # [bs, queries, heads, levels, points, 2]
-            coords_curr = coords_curr.contiguous().view(bs * num_query * num_heads * num_levels * num_points, 2)
-                    
+            # Current sampling locations (t=1)
+            coords_curr = sampling_locations[bs:]  # [bs, num_query, num_heads, num_levels, num_points, 2]
+            coords_curr = coords_curr.permute(0, 2, 1, 3, 4, 5).contiguous()  # [bs, heads, queries, levels, points, 2]
+            coords_curr = coords_curr.view(bs * num_heads * num_query * num_levels * num_points, 2)
             x_curr, y_curr = coords_curr[:, 0], coords_curr[:, 1]
+            
             t_hist = torch.zeros_like(x)       
             t_curr = torch.ones_like(x)       
 

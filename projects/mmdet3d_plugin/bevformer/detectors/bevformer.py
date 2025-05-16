@@ -3,6 +3,8 @@
 # ---------------------------------------------
 #  Modified by Zhiqi Li
 # ---------------------------------------------
+#  Modified by Tammy Li
+# ---------------------------------------------
 
 import torch
 from mmcv.runner import force_fp32, auto_fp16
@@ -229,6 +231,15 @@ class BEVFormer(MVXTwoStageDetector):
         losses_pts = self.forward_pts_train(img_feats, gt_bboxes_3d,
                                             gt_labels_3d, img_metas,
                                             gt_bboxes_ignore, prev_bev)
+
+        # Add regularization for z_log_sigma
+        encoder = self.pts_bbox_head.transformer.encoder
+        if hasattr(encoder, "get_height_params"):
+            z_mu, z_log_sigma = encoder.get_height_params()
+            loss_z_reg = 1e-2 * z_log_sigma.pow(2).mean()
+            loss_mu_reg = 1e-2 * ((z_mu - 0.5).pow(2)).mean()  # optional
+            losses_pts['loss_z_reg'] = loss_z_reg
+            losses_pts['loss_mu_reg'] = loss_mu_reg
 
         losses.update(losses_pts)
         return losses

@@ -2,7 +2,15 @@
   
 # BEVFormer: a Cutting-edge Baseline for Camera-based Detection
 </div>
-
+Author: Lulu Liu, Tammy Li <br/>
+We modified the code to include three enhancements as showing in the paper.
+Code Changes:
+projects/mmdet3d_plugin/bevformer/modules/temporal_self_attention.py <br/>
+projects/mmdet3d_plugin/bevformer/modules/encoder.py <br/>
+projects/mmdet3d_plugin/bevformer/detectors/bevformer.py <br/>
+Test results are under /test folder. <br/>
+Metric evaluation and generation are in /metric_comparison <br/>
+------------------------------------------------------
 
 https://user-images.githubusercontent.com/27915819/161392594-fc0082f7-5c37-4919-830a-2dd423c1d025.mp4
 

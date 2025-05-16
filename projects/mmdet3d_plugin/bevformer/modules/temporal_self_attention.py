@@ -43,11 +43,14 @@ class TensorCPField(nn.Module):
         self.D = nn.Parameter(torch.randn(rank, s_size))  # scale
 
         self.proj = nn.Linear(rank, feature_dim)
+        nn.init.xavier_uniform_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
 
     def interpolate_1d(self, tensor, idx_norm, axis_size):
         idx = idx_norm * (axis_size - 1)
         idx0 = torch.floor(idx).long().clamp(0, axis_size - 2)
-        idx1 = idx0 + 1
+        idx1 = (idx0 + 1).clamp(0, axis_size - 1)
+
         weight = (idx - idx0.float()).unsqueeze(0)
         v0 = tensor[:, idx0]
         v1 = tensor[:, idx1]
@@ -335,6 +338,9 @@ class TemporalSelfAttention(BaseModule):
             coords_hist = coords_hist.permute(0, 2, 1, 3, 4, 5).contiguous()  # [bs, heads, queries, levels, points, 2]
             coords_hist = coords_hist.view(bs * num_heads * num_query * num_levels * num_points, 2)
             x, y = coords_hist[:, 0], coords_hist[:, 1]
+            x = x.clamp(0, 1)
+            y = y.clamp(0, 1)
+
 
             # Coordinates for t=1: reference_points (current)
             # Current sampling locations (t=1)
@@ -342,16 +348,20 @@ class TemporalSelfAttention(BaseModule):
             coords_curr = coords_curr.permute(0, 2, 1, 3, 4, 5).contiguous()  # [bs, heads, queries, levels, points, 2]
             coords_curr = coords_curr.view(bs * num_heads * num_query * num_levels * num_points, 2)
             x_curr, y_curr = coords_curr[:, 0], coords_curr[:, 1]
+            x_curr = x_curr.clamp(0, 1)
+            y_curr = y_curr.clamp(0, 1)
             
             t_hist = torch.zeros_like(x)       
             t_curr = torch.ones_like(x)       
 
             # Form scale to pass
             scale_ids = torch.arange(num_levels, device=query.device).float()
-            scale_ids = scale_ids / (num_levels - 1)  # normalize to [0,1]
+            if num_levels > 1:
+                scale_ids = scale_ids / (num_levels - 1)
+            else:
+                scale_ids = torch.zeros_like(scale_ids)
             scale_tensor = scale_ids[None, None,None, :, None].expand(bs, num_query, num_heads, num_levels, num_points)
             scale_tensor = scale_tensor.contiguous().view(-1)
-
 
             feat_hist = self.tensorcp(x, y, t_hist,scale_tensor)  # [M, embed_dim]
             feat_curr = self.tensorcp(x_curr, y_curr, t_curr,scale_tensor)
@@ -375,8 +385,10 @@ class TemporalSelfAttention(BaseModule):
 
             output_tensorcp = torch.stack([fused_hist, fused_curr], dim=-1)  # [num_query, embed_dim, bs, 2]
        
+        query_input = query[..., 256:]  # slice only the original query part
+        fall_back_score = torch.sigmoid(self.grid_conf(query_input))
         
-        fall_back_score = torch.sigmoid(self.grid_conf(query))  # [bs, num_query, 1]
+        # fall_back_score = torch.sigmoid(self.grid_conf(query))  # [bs, num_query, 1]
         fall_back_score = fall_back_score.permute(1, 2, 0)  # [num_query, 1, bs]
         fall_back_score = fall_back_score.expand(-1, self.embed_dims, -1)  # [num_query, embed_dim, bs]
         fall_back_score = fall_back_score.unsqueeze(-1)  # [num_query, embed_dim, bs, 1]
@@ -385,7 +397,13 @@ class TemporalSelfAttention(BaseModule):
 
         output = fall_back_score * output + (1 - fall_back_score) * output_tensorcp
 
-        
+        if torch.isnan(output).any() or torch.isinf(output).any():
+            print("Detected invalid values in output before fusion")
+            print("Fallback score NaNs:", torch.isnan(fall_back_score).any())
+            print("TensorCP NaNs:", torch.isnan(output_tensorcp).any())
+            print("Output deformable NaNs:", torch.isnan(output).any())
+            raise ValueError("Aborting due to NaNs")
+
         #### Add confidence to the attention weights
         conf_level = self.confidence(query).view(
             bs, num_query,  self.num_heads, self.num_bev_queue, self.num_levels, self.num_points)

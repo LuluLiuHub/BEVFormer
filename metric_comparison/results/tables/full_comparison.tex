@@ -1,0 +1,33 @@
+\begin{table}[ht]
+\centering
+\caption{Comprehensive Performance Comparison Across All Models}
+\label{tab:full_comparison}
+\footnotesize
+\renewcommand{\arraystretch}{1.2}
+\rowcolors{2}{gray!10}{white}
+\begin{tabularx}{\textwidth}{lXXXX}
+\toprule
+\rowcolor{gray!30}
+\textbf{Metric} & \textbf{Baseline} & \textbf{Uncertainty Fusion} & \textbf{TensorCP Workflow} & \textbf{Multi-Height Attention} \\
+\midrule
+\multicolumn{5}{l}{\textbf{Overall Metrics}} \\
+Mean AP & 0.0129 & 0.0208 & 0.0141 & 0.0163 \\
+ND Score & 0.0613 & 0.0670 & 0.0655 & 0.0585 \\
+Eval Time (s) & 6.0810 & 6.0583 & 6.2300 & 5.6474 \\
+\midrule
+\multicolumn{5}{l}{\textbf{Class-Specific AP}} \\
+car & 0.0765 & 0.0965 & 0.0981 & 0.1003 \\
+bus & 0.0007 & 0.0397 & 0.0000 & 0.0061 \\
+pedestrian & 0.0311 & 0.0365 & 0.0279 & 0.0350 \\
+truck & 0.0175 & 0.0341 & 0.0088 & 0.0215 \\
+motorcycle & 0.0000 & 0.0000 & 0.0045 & 0.0000 \\
+\midrule
+\multicolumn{5}{l}{\textbf{Error Metrics (Lower is Better)}} \\
+Trans Err & 1.1434 & 1.1403 & 1.1372 & 1.1827 \\
+Scale Err & 0.6801 & 0.6796 & 0.6978 & 0.6984 \\
+Orient Err & 1.2494 & 1.2128 & 1.2301 & 1.2329 \\
+Vel Err & 1.2330 & 1.1946 & 1.1865 & 1.1833 \\
+Attr Err & 0.7712 & 0.7546 & 0.7178 & 0.7981 \\
+\bottomrule
+\end{tabularx}
+\end{table}
